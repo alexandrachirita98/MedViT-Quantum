@@ -56,6 +56,8 @@ class QMedViT(MedViT):
         qbackend=None,
         quantum_stages=(3,),
         quantum_block_indices=None,
+        qpu_mode=False,
+        qpu_shots=5000,
     ):
         super().__init__(
             stem_chs=stem_chs,
@@ -88,6 +90,11 @@ class QMedViT(MedViT):
         self.quantum_block_indices = (
             None if quantum_block_indices is None else tuple(quantum_block_indices)
         )
+        # QPU-style execution: per-sample, finite shots, no U-extraction
+        # shortcut. Set qpu_mode=True for inference on real quantum hardware
+        # (or a shots-based simulator). Default False = analytic simulator path.
+        self.qpu_mode = qpu_mode
+        self.qpu_shots = qpu_shots
         self.path_dropout = path_dropout
 
         stage_of_block = []

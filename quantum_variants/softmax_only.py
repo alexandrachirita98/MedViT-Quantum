@@ -50,9 +50,42 @@ def _build_qsoftmax(n_qubits: int, q_depth: int, qdevice: str, qbackend: str | N
             for i in range(1, n_qubits - 1, 2):
                 qml.SingleExcitation(weights[d, a], wires=[i, i + 1])
                 a += 1
-        return qml.probs(wires=range(n_qubits))
+        # Return the full state so the caller can extract the unitary U(theta)
+        # by feeding the D basis vectors once per forward, then apply U
+        # classically to all (B,H,N) samples (mathematically identical to
+        # running the circuit per sample, but avoids per-sample Pennylane
+        # overhead — the unitary depends only on `weights`, not on `amps`).
+        return qml.state()
 
     return circuit, weight_shape
+
+
+def _build_qsoftmax_qpu(n_qubits: int, q_depth: int, qdevice: str, qbackend: str | None, shots: int):
+    """QPU-style QNode: per-sample execution, finite shots, returns sampled
+    probabilities (not the statevector). Mirrors what running on real quantum
+    hardware looks like — no statevector access, stochastic estimates of
+    |U(theta) * amps|^2 from `shots` measurements per call. Intended for
+    inference only (gradients via parameter-shift would be expensive and noisy).
+    """
+    dev_kwargs = {"wires": n_qubits, "shots": shots}
+    if qbackend is not None:
+        dev_kwargs["backend"] = qbackend
+    dev = qml.device(qdevice, **dev_kwargs)
+
+    @qml.qnode(dev, interface="torch")
+    def circuit(amps, weights):
+        qml.AmplitudeEmbedding(amps, wires=range(n_qubits), normalize=False)
+        for d in range(q_depth):
+            a = 0
+            for i in range(0, n_qubits - 1, 2):
+                qml.SingleExcitation(weights[d, a], wires=[i, i + 1])
+                a += 1
+            for i in range(1, n_qubits - 1, 2):
+                qml.SingleExcitation(weights[d, a], wires=[i, i + 1])
+                a += 1
+        return qml.probs(wires=range(n_qubits))
+
+    return circuit
 
 
 class Q_E_MHSA(nn.Module):
@@ -70,6 +103,8 @@ class Q_E_MHSA(nn.Module):
         q_depth=3,
         qdevice="default.qubit",
         qbackend=None,
+        qpu_mode=False,
+        qpu_shots=5000,
     ):
         super().__init__()
         self.dim = dim
@@ -94,8 +129,20 @@ class Q_E_MHSA(nn.Module):
 
         self.n_qubits = n_qubits
         self.softmax_dim = 1 << n_qubits  # 2 ** n_qubits
+        self.qpu_mode = qpu_mode
+        self.qpu_shots = qpu_shots
+        # Simulator path: analytic, broadcast-friendly, returns state for
+        # one-shot U(theta) extraction. Always built — used for training and
+        # whenever qpu_mode is False.
         self.qsoftmax, weight_shape = _build_qsoftmax(n_qubits, q_depth, qdevice, qbackend)
         self.softmax_weights = nn.Parameter(0.5 * torch.randn(*weight_shape))
+        # QPU path: per-sample, finite shots, returns probs. Mirrors real
+        # hardware execution (no statevector access). Built lazily only when
+        # qpu_mode is requested.
+        if qpu_mode:
+            self.qsoftmax_qpu = _build_qsoftmax_qpu(
+                n_qubits, q_depth, qdevice, qbackend, qpu_shots
+            )
 
     def merge_bn(self, pre_bn):
         merge_pre_bn(self.q, pre_bn)
@@ -109,7 +156,7 @@ class Q_E_MHSA(nn.Module):
 
     def _quantum_softmax(self, attn):
         # attn: (B, H, N, M) classical scores. Replace softmax(dim=-1) with
-        # alpha_ij = |<j| W(theta) | s_i / ||s_i||_2 >|^2  (Cherrat et al.).
+        # alpha_ij = |<j| U(theta) | s_i / ||s_i||_2 >|^2  (Cherrat et al.).
         B, H, N, M = attn.shape
         D = self.softmax_dim
         top_idx = None
@@ -123,12 +170,29 @@ class Q_E_MHSA(nn.Module):
             x = attn
 
         norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-9)
-        amps = (x / norm).reshape(-1, D)
+        amps = x / norm  # (B, H, N, D)
 
-        # default.qubit broadcasts over the leading dim of `amps`, so the
-        # whole batch goes through the circuit in a single call.
-        probs = self.qsoftmax(amps, self.softmax_weights)
-        probs = probs.reshape(B, H, N, D)
+        if self.qpu_mode:
+            # QPU-style execution: no statevector shortcut, results are sampled
+            # from `qpu_shots` measurements per input — what real hardware does.
+            # We feed all (B*H*N) samples as a single broadcasted call. On
+            # qiskit.remote this becomes ONE batched job submission (Sampler
+            # primitive evaluates the same parametric circuit at T binding
+            # values) instead of T separate jobs — orders-of-magnitude faster
+            # on real backends. Intended for inference only.
+            amps_flat = amps.reshape(-1, D)
+            probs_flat = self.qsoftmax_qpu(amps_flat, self.softmax_weights)
+            probs = probs_flat.to(amps.dtype).reshape(B, H, N, D)
+        else:
+            # Simulator path: extract U(theta) once by feeding the D basis
+            # vectors through the QNode (one broadcasted call), then apply U
+            # classically to all samples. Mathematically identical to the
+            # per-sample call but ~1000x faster on default.qubit.
+            basis = torch.eye(D, dtype=amps.dtype, device=amps.device)
+            UT = self.qsoftmax(basis, self.softmax_weights)  # (D, D), complex
+            UT = UT.real.to(amps.dtype)                       # RBS pyramid is real
+            transformed = amps @ UT          # (B, H, N, D), equivalent to U @ amps
+            probs = transformed ** 2          # Born rule
 
         if M < D:
             probs = probs[..., :M]
@@ -192,6 +256,8 @@ class QLTB(nn.Module):
         q_depth=3,
         qdevice="default.qubit",
         qbackend=None,
+        qpu_mode=False,
+        qpu_shots=5000,
     ):
         super().__init__()
         from timm.models.layers import DropPath
@@ -216,6 +282,8 @@ class QLTB(nn.Module):
             q_depth=q_depth,
             qdevice=qdevice,
             qbackend=qbackend,
+            qpu_mode=qpu_mode,
+            qpu_shots=qpu_shots,
         )
         self.mhsa_path_dropout = DropPath(path_dropout * mix_block_ratio)
 
@@ -269,4 +337,6 @@ class QMedViT_Softmax_Only(QMedViT):
             q_depth=self.q_depth,
             qdevice=self.qdevice,
             qbackend=self.qbackend,
+            qpu_mode=self.qpu_mode,
+            qpu_shots=self.qpu_shots,
         )
