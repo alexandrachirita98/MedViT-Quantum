@@ -29,22 +29,31 @@ def _build_qsoftmax(n_qubits: int, q_depth: int, qdevice: str, qbackend: str | N
     dev_kwargs = {"wires": n_qubits}
     if qbackend is not None:
         dev_kwargs["backend"] = qbackend
+    if qdevice == "default.qubit":
+        # complex64 statevector: ~2x faster + half memory vs default complex128,
+        # safe for 4-qubit Born-rule probabilities.
+        dev_kwargs["c_dtype"] = torch.complex64
     dev = qml.device(qdevice, **dev_kwargs)
 
-    n_pairs = n_qubits * (n_qubits - 1) // 2
+    # Brick-wall nearest-neighbor RBS pyramid (Cherrat et al., §5): per layer,
+    # an even sublayer of pairs (0,1),(2,3),... followed by an odd sublayer
+    # (1,2),(3,4),... — fewer gates than all-to-all at equal expressivity.
+    n_even = n_qubits // 2
+    n_odd = (n_qubits - 1) // 2
+    n_pairs = n_even + n_odd
     weight_shape = (q_depth, n_pairs)
 
-    @qml.qnode(dev, interface="torch", diff_method="best")
+    @qml.qnode(dev, interface="torch", diff_method="backprop", cache=True)
     def circuit(amps, weights):
         qml.AmplitudeEmbedding(amps, wires=range(n_qubits), normalize=False)
         for d in range(q_depth):
             a = 0
-            for i in range(n_qubits - 1):
-                for j in range(i + 1, n_qubits):
-                    # SingleExcitation is the RBS gate used in the paper:
-                    # a real, norm-preserving 2-qubit rotation on {|01>,|10>}.
-                    qml.SingleExcitation(weights[d, a], wires=[i, j])
-                    a += 1
+            for i in range(0, n_qubits - 1, 2):
+                qml.SingleExcitation(weights[d, a], wires=[i, i + 1])
+                a += 1
+            for i in range(1, n_qubits - 1, 2):
+                qml.SingleExcitation(weights[d, a], wires=[i, i + 1])
+                a += 1
         return qml.probs(wires=range(n_qubits))
 
     return circuit, weight_shape
@@ -62,7 +71,7 @@ class Q_E_MHSA(nn.Module):
         proj_drop=0.0,
         sr_ratio=1,
         n_qubits=4,
-        q_depth=2,
+        q_depth=1,
         qdevice="default.qubit",
         qbackend=None,
     ):
@@ -180,7 +189,7 @@ class QLTB(nn.Module):
         attn_drop=0,
         drop=0,
         n_qubits=4,
-        q_depth=2,
+        q_depth=1,
         qdevice="default.qubit",
         qbackend=None,
     ):
@@ -237,7 +246,12 @@ class QLTB(nn.Module):
 
 class QMedViT_Softmax_Only(QMedViT):
     def _should_quantize_block(self, block, stage_id, block_idx) -> bool:
-        return isinstance(block, LTB) and stage_id in self.quantum_stages
+        if not (isinstance(block, LTB) and stage_id in self.quantum_stages):
+            return False
+        if self.quantum_block_indices is None:
+            return True
+        within = block_idx - sum(self.depths[:stage_id])
+        return within in self.quantum_block_indices
 
     def _build_quantum_block(self, block, stage_id, block_idx, **ctx) -> nn.Module:
         return QLTB(

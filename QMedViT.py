@@ -50,11 +50,12 @@ class QMedViT(MedViT):
         head_dim=32,
         mix_block_ratio=0.75,
         use_checkpoint=False,
-        n_qubits=4,
-        q_depth=2,
+        n_qubits=3,
+        q_depth=1,
         qdevice="default.qubit",
         qbackend=None,
         quantum_stages=(3,),
+        quantum_block_indices=None,
     ):
         super().__init__(
             stem_chs=stem_chs,
@@ -82,6 +83,11 @@ class QMedViT(MedViT):
         self.qdevice = qdevice
         self.qbackend = qbackend
         self.quantum_stages = tuple(quantum_stages)
+        # Per-stage within-stage block indices to quantize. None = all blocks
+        # in `quantum_stages`. Use e.g. (2,) to keep only the last LTB quantum.
+        self.quantum_block_indices = (
+            None if quantum_block_indices is None else tuple(quantum_block_indices)
+        )
         self.path_dropout = path_dropout
 
         stage_of_block = []
