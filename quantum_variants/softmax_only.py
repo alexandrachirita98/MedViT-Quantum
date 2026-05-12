@@ -74,7 +74,10 @@ def _build_qsoftmax_qpu(n_qubits: int, q_depth: int, qdevice: str, qbackend: str
 
     @qml.qnode(dev, interface="torch")
     def circuit(amps, weights):
-        qml.AmplitudeEmbedding(amps, wires=range(n_qubits), normalize=False)
+        # normalize=True: amps come in as float32 (~1e-7 precision); the device
+        # renormalizes in complex128, eliminating the drift that otherwise
+        # trips PennyLane's strict sum-to-1 check during finite-shot sampling.
+        qml.AmplitudeEmbedding(amps, wires=range(n_qubits), normalize=True)
         for d in range(q_depth):
             a = 0
             for i in range(0, n_qubits - 1, 2):
@@ -169,8 +172,17 @@ class Q_E_MHSA(nn.Module):
         else:
             x = attn
 
-        norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-9)
-        amps = x / norm  # (B, H, N, D)
+        norm = x.norm(dim=-1, keepdim=True)
+        # For rows with effectively-zero score (norm < eps), fall back to a
+        # uniform amplitude (1/sqrt(D)) — semantically the same as softmax of
+        # all-equal logits, and keeps |amps|^2 summing to 1 (required by
+        # AmplitudeEmbedding on the QPU path).
+        zero_row = norm < 1e-9
+        safe_norm = torch.where(zero_row, torch.ones_like(norm), norm)
+        amps = x / safe_norm
+        if zero_row.any():
+            uniform = torch.full_like(amps, 1.0 / (D ** 0.5))
+            amps = torch.where(zero_row.expand_as(amps), uniform, amps)
 
         if self.qpu_mode:
             # QPU-style execution: no statevector shortcut, results are sampled
