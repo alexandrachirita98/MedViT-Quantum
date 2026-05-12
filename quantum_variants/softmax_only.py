@@ -30,8 +30,11 @@ def _build_qsoftmax(n_qubits: int, q_depth: int, qdevice: str, qbackend: str | N
     if qbackend is not None:
         dev_kwargs["backend"] = qbackend
     if qdevice == "default.qubit":
-        # complex64 statevector: ~2x faster + half memory vs default complex128,
-        # safe for 4-qubit Born-rule probabilities.
+        # complex64 statevector: ~2x faster + half memory vs default complex128.
+        # The rewritten default.qubit (PennyLane >=0.32) dropped c_dtype from
+        # its constructor; default.qubit.legacy still exposes it and supports
+        # parameter broadcasting.
+        qdevice = "default.qubit.legacy"
         dev_kwargs["c_dtype"] = torch.complex64
     dev = qml.device(qdevice, **dev_kwargs)
 
