@@ -192,7 +192,13 @@ class Q_E_MHSA(nn.Module):
             # primitive evaluates the same parametric circuit at T binding
             # values) instead of T separate jobs — orders-of-magnitude faster
             # on real backends. Intended for inference only.
-            amps_flat = amps.reshape(-1, D)
+            # Cast to float64 and renormalize in higher precision before
+            # handing off to PennyLane. The device runs in complex128, and
+            # its finite-shot sampler checks |state|^2 sums to 1 with a
+            # tolerance of ~100*eps(float64) ≈ 2e-14 — float32 amplitudes
+            # carry ~1e-7 drift, which fails that check.
+            amps_flat = amps.reshape(-1, D).to(torch.float64)
+            amps_flat = amps_flat / amps_flat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             probs_flat = self.qsoftmax_qpu(amps_flat, self.softmax_weights)
             probs = probs_flat.to(amps.dtype).reshape(B, H, N, D)
         else:
