@@ -51,7 +51,7 @@ class QMedViT(MedViT):
         mix_block_ratio=0.75,
         use_checkpoint=False,
         n_qubits=3,
-        q_depth=1,
+        q_depth=3,
         qdevice="default.qubit",
         qbackend=None,
         quantum_stages=(3,),

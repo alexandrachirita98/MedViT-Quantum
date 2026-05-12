@@ -67,7 +67,7 @@ class Q_E_MHSA(nn.Module):
         proj_drop=0.0,
         sr_ratio=1,
         n_qubits=4,
-        q_depth=1,
+        q_depth=3,
         qdevice="default.qubit",
         qbackend=None,
     ):
@@ -95,7 +95,7 @@ class Q_E_MHSA(nn.Module):
         self.n_qubits = n_qubits
         self.softmax_dim = 1 << n_qubits  # 2 ** n_qubits
         self.qsoftmax, weight_shape = _build_qsoftmax(n_qubits, q_depth, qdevice, qbackend)
-        self.softmax_weights = nn.Parameter(0.1 * torch.randn(*weight_shape))
+        self.softmax_weights = nn.Parameter(0.5 * torch.randn(*weight_shape))
 
     def merge_bn(self, pre_bn):
         merge_pre_bn(self.q, pre_bn)
@@ -112,11 +112,13 @@ class Q_E_MHSA(nn.Module):
         # alpha_ij = |<j| W(theta) | s_i / ||s_i||_2 >|^2  (Cherrat et al.).
         B, H, N, M = attn.shape
         D = self.softmax_dim
+        top_idx = None
         if M < D:
             x = F.pad(attn, (0, D - M))
         elif M > D:
-            # Truncate: only the first D scores per query are quantum-softmaxed.
-            x = attn[..., :D]
+            # Top-D selection: keep the D highest scores per query so the
+            # quantum block attends to the most relevant keys, not the first D.
+            x, top_idx = attn.topk(D, dim=-1)
         else:
             x = attn
 
@@ -132,8 +134,10 @@ class Q_E_MHSA(nn.Module):
             probs = probs[..., :M]
             probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         elif M > D:
-            tail = torch.zeros(B, H, N, M - D, device=attn.device, dtype=attn.dtype)
-            probs = torch.cat([probs, tail], dim=-1)
+            # Scatter the D probabilities back to the original key positions.
+            full = torch.zeros(B, H, N, M, device=attn.device, dtype=probs.dtype)
+            full.scatter_(-1, top_idx, probs)
+            probs = full
         return probs
 
     def forward(self, x):
@@ -185,7 +189,7 @@ class QLTB(nn.Module):
         attn_drop=0,
         drop=0,
         n_qubits=4,
-        q_depth=1,
+        q_depth=3,
         qdevice="default.qubit",
         qbackend=None,
     ):
