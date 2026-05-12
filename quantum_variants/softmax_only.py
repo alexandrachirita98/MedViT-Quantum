@@ -118,9 +118,9 @@ class Q_E_MHSA(nn.Module):
         norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-9)
         amps = (x / norm).reshape(-1, D)
 
-        probs = torch.empty_like(amps)
-        for t in range(amps.shape[0]):
-            probs[t] = self.qsoftmax(amps[t], self.softmax_weights)
+        # default.qubit broadcasts over the leading dim of `amps`, so the
+        # whole batch goes through the circuit in a single call.
+        probs = self.qsoftmax(amps, self.softmax_weights)
         probs = probs.reshape(B, H, N, D)
 
         if M < D:
