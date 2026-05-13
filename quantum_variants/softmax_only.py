@@ -72,7 +72,7 @@ def _build_qsoftmax_qpu(n_qubits: int, q_depth: int, qdevice: str, qbackend: str
         dev_kwargs["backend"] = qbackend
     dev = qml.device(qdevice, **dev_kwargs)
 
-    @qml.qnode(dev, interface="torch")
+    @qml.qnode(dev, interface="torch", diff_method=None)
     def circuit(amps, weights):
         # normalize=True: amps come in as float32 (~1e-7 precision); the device
         # renormalizes in complex128, eliminating the drift that otherwise
