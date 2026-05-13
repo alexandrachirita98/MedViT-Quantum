@@ -208,7 +208,7 @@ class Q_E_MHSA(nn.Module):
             amps_flat = amps_flat / amps_flat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             with torch.no_grad():
                 probs_flat = self.qsoftmax_qpu(amps_flat, self.softmax_weights.detach())
-            probs = probs_flat.to(amps.dtype).reshape(B, H, N, D)
+            probs = probs_flat.to(device=amps.device, dtype=amps.dtype).reshape(B, H, N, D)
         else:
             # Simulator path: extract U(theta) once by feeding the D basis
             # vectors through the QNode (one broadcasted call), then apply U
