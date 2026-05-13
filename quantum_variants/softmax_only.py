@@ -197,9 +197,17 @@ class Q_E_MHSA(nn.Module):
             # its finite-shot sampler checks |state|^2 sums to 1 with a
             # tolerance of ~100*eps(float64) ≈ 2e-14 — float32 amplitudes
             # carry ~1e-7 drift, which fails that check.
-            amps_flat = amps.reshape(-1, D).to(torch.float64)
+            # Hard-cut the gradient at the QPU boundary. PennyLane 0.45's
+            # `diff_method=None` is not honored when the device has shots —
+            # the torch interface still registers a backward hook that falls
+            # back to parameter-shift, which then errors on the broadcasted
+            # (B*H*N, D) input (#4462). Detaching inputs+weights and wrapping
+            # in no_grad bypasses that path entirely. This is consistent with
+            # the design intent: the QPU path is inference-only.
+            amps_flat = amps.detach().reshape(-1, D).to(torch.float64)
             amps_flat = amps_flat / amps_flat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            probs_flat = self.qsoftmax_qpu(amps_flat, self.softmax_weights)
+            with torch.no_grad():
+                probs_flat = self.qsoftmax_qpu(amps_flat, self.softmax_weights.detach())
             probs = probs_flat.to(amps.dtype).reshape(B, H, N, D)
         else:
             # Simulator path: extract U(theta) once by feeding the D basis
