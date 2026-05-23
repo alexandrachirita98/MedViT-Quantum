@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# PyTorch / ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+checkpoints/
+runs/
+wandb/
+lightning_logs/
+mlruns/
+
+# Datasets cached locally
+*.npz
+*.h5
+*.hdf5
+data/
+datasets/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Claude/agent local state
+.claude/
