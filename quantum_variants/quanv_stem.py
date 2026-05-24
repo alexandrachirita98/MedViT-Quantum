@@ -248,6 +248,105 @@ class QuanvStem(nn.Module):
         return self.act(self.bn(feat))
 
 
+class QuanvBlock(nn.Module):
+    """Generalization of QuanvStem to arbitrary input channel counts.
+
+    QuanvStem averages over RGB before the threshold encoder, which is fine
+    for 3 semantically-similar channels but lossy for the 32-64 channels of
+    learned feature maps further down the stem. QuanvBlock instead samples
+    `n_qubits` random positions per filter from the full C_in * k * k
+    unfolded patch — fixed at init, distinct per filter — preserving the
+    threshold + lookup-table pipeline while letting different filters see
+    different channel/spatial subsets of the patch (the random-projection
+    spirit of Henderson et al. §3.4).
+
+    Forward path is still O(1) per patch (lookup, not circuit). The lookup
+    tables are built the same way as QuanvStem (analytic or shots-sampled).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        connection_prob: float = 0.3,
+        seed: int = 0,
+        qdevice: str = "default.qubit",
+        qbackend: str | None = None,
+        qpu_mode: bool = False,
+        qpu_shots: int = 5000,
+    ):
+        super().__init__()
+        n_qubits = kernel_size * kernel_size
+        M = in_channels * n_qubits
+        if n_qubits > M:
+            raise ValueError(f"n_qubits ({n_qubits}) > C*k*k ({M})")
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.n_qubits = n_qubits
+        self.qpu_mode = qpu_mode
+        self.qpu_shots = qpu_shots
+
+        rng = np.random.default_rng(seed)
+
+        # Per-filter position selector: each row picks n_qubits unique
+        # positions from the C*k*k unfolded patch. Fixed at init.
+        pos = np.empty((out_channels, n_qubits), dtype=np.int64)
+        for c in range(out_channels):
+            pos[c] = rng.choice(M, size=n_qubits, replace=False)
+        self.register_buffer("position_indices", torch.from_numpy(pos))
+
+        tables = []
+        for _ in range(out_channels):
+            ops = _sample_circuit_ops(n_qubits, connection_prob, rng)
+            if qpu_mode:
+                tables.append(_build_lookup_table_shots(ops, n_qubits, qpu_shots, qdevice, qbackend))
+            else:
+                tables.append(_build_lookup_table(ops, n_qubits, qdevice, qbackend))
+        self.register_buffer("lookup", torch.stack(tables, dim=0))
+
+        # Bit weights with same MSB-first convention as QuanvStem.
+        bit_w = (1 << torch.arange(n_qubits - 1, -1, -1, dtype=torch.long)).view(1, 1, n_qubits, 1)
+        self.register_buffer("bit_weights", bit_w)
+
+        self.bn = nn.BatchNorm2d(out_channels, eps=NORM_EPS)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        k, s, p = self.kernel_size, self.stride, self.padding
+        H_out = (H + 2 * p - k) // s + 1
+        W_out = (W + 2 * p - k) // s + 1
+
+        # (B, C*k*k, L). Advanced index along dim 1 with (out_channels, n_qubits)
+        # -> (B, out_channels, n_qubits, L) — each filter sees its 9 sampled cells
+        # at every spatial position.
+        patches = F.unfold(x, kernel_size=k, stride=s, padding=p)
+        L = patches.shape[-1]
+        selected = patches[:, self.position_indices, :]                   # (B, out_ch, n_q, L)
+
+        # Median across the n_qubits selected cells (per filter, per patch).
+        # Same Median Binary Pattern rationale as QuanvStem: prevents bucket
+        # collapse on dark imagery where a fixed threshold would push most
+        # patches to a single bucket.
+        median = selected.median(dim=2, keepdim=True).values              # (B, out_ch, 1, L)
+        bits = (selected > median).long()                                 # (B, out_ch, n_q, L)
+        idx = (bits * self.bit_weights).sum(dim=2)                        # (B, out_ch, L)
+
+        # Per-filter lookup: feat[b, c, l] = lookup[c, idx[b, c, l]].
+        lookup_b = self.lookup.unsqueeze(0).expand(B, -1, -1)             # (B, out_ch, D)
+        feat = lookup_b.gather(dim=2, index=idx)                          # (B, out_ch, L)
+        feat = feat.view(B, self.out_channels, H_out, W_out).contiguous()
+
+        return self.act(self.bn(feat))
+
+
 class QMedViT_Quanv_Stem(QMedViT):
     def __init__(
         self,
@@ -272,6 +371,82 @@ class QMedViT_Quanv_Stem(QMedViT):
             qpu_mode=self.qpu_mode,
             qpu_shots=self.qpu_shots,
         )
+
+    def _should_quantize_block(self, block, stage_id, block_idx) -> bool:
+        return False
+
+    def _build_quantum_block(self, block, stage_id, block_idx, **ctx) -> nn.Module:
+        return block
+
+
+class QMedViT_Quanv_All_Stem(QMedViT):
+    """All four stem ConvBNReLU blocks replaced with quanvolutional layers.
+
+    Block 0 (RGB input, 3 channels) uses QuanvStem (channel-mean reduction +
+    9-spatial-cell threshold). Blocks 1-3 (multi-channel feature maps) use
+    QuanvBlock (per-filter random sampling of 9 positions across the full
+    C*k*k unfolded patch). Each block gets a distinct seed so circuits and
+    position selectors are uncorrelated across the stem.
+
+    None of the four blocks contributes trainable quantum parameters — only
+    BN gamma/beta per block. The model has 4 frozen random-projection layers
+    at the input, then trains everything from features[0] onward.
+    """
+
+    def __init__(
+        self,
+        *args,
+        quanv_kernel_size: int = 3,
+        quanv_connection_prob: float = 0.3,
+        quanv_seed: int = 0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        info = [
+            {
+                "in_channels": blk.conv.in_channels,
+                "out_channels": blk.conv.out_channels,
+                "stride": blk.conv.stride[0] if isinstance(blk.conv.stride, tuple) else blk.conv.stride,
+            }
+            for blk in self.stem
+        ]
+
+        new_stem = []
+        # Block 0: RGB-tuned, reuse QuanvStem (channel-mean reduction is OK
+        # for 3 semantically-similar channels).
+        new_stem.append(QuanvStem(
+            in_channels=info[0]["in_channels"],
+            out_channels=info[0]["out_channels"],
+            kernel_size=quanv_kernel_size,
+            stride=info[0]["stride"],
+            padding=quanv_kernel_size // 2,
+            connection_prob=quanv_connection_prob,
+            seed=quanv_seed,
+            qdevice=self.qdevice,
+            qbackend=self.qbackend,
+            qpu_mode=self.qpu_mode,
+            qpu_shots=self.qpu_shots,
+        ))
+
+        # Blocks 1-3: multi-channel feature maps, use QuanvBlock (per-filter
+        # random position sampling preserves channel diversity).
+        for i in range(1, len(info)):
+            new_stem.append(QuanvBlock(
+                in_channels=info[i]["in_channels"],
+                out_channels=info[i]["out_channels"],
+                kernel_size=quanv_kernel_size,
+                stride=info[i]["stride"],
+                padding=quanv_kernel_size // 2,
+                connection_prob=quanv_connection_prob,
+                seed=quanv_seed + i,
+                qdevice=self.qdevice,
+                qbackend=self.qbackend,
+                qpu_mode=self.qpu_mode,
+                qpu_shots=self.qpu_shots,
+            ))
+
+        self.stem = nn.Sequential(*new_stem)
 
     def _should_quantize_block(self, block, stage_id, block_idx) -> bool:
         return False
