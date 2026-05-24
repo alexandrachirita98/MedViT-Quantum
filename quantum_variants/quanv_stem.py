@@ -4,14 +4,39 @@ stem with a Quanvolutional layer (Henderson, Shakya, Pradhan, Cook, 2019,
 Circuits", arXiv:1904.04767, §2.3 and §3.4–3.5).
 
 Each output channel is one random quantum circuit sampled once at __init__
-and frozen — there are no trainable quantum parameters. Encoding is the
-paper's threshold scheme (§3.5); decoding is sum_i <Z_i> per patch.
+and frozen — there are no trainable quantum parameters. Decoding is
+sum_i <Z_i> per patch (Henderson et al. §3.5).
 
-Because threshold encoding has a finite input space (2^(k*k) bitstrings per
-patch), all input->output mappings are precomputed into a lookup table at
-init (paper §3.5). forward() never executes a live circuit — it indexes
-the table — which is the only tractable way to run a quanvolution over a
-112x112 spatial grid with 64 filters.
+Encoding adapts the threshold scheme of Henderson et al. (§3.5) by replacing
+the fixed global threshold with a per-patch median (Local Binary Pattern
+family — Ojala, Pietikäinen, Mäenpää, "Multiresolution Gray-Scale and
+Rotation Invariant Texture Classification with Local Binary Patterns",
+IEEE TPAMI 24(7) (2002) 971; per-patch median variant per Hafiane,
+Seetharaman, Zavidovique, "Median Binary Pattern for Textures Classification",
+ICIAR / Springer LNCS 4633 (2007) 387). The original fixed-0 threshold
+collapses fundus-like medical imagery to ~2 distinct buckets out of 2^(k*k)
+(Shannon entropy ≈ 0.7 nats), starving the downstream network of signal.
+Per-patch median forces ~50/50 bit balance and restores near-uniform
+coverage of the basis states, encoding local relative contrast instead of
+absolute intensity.
+
+Because the encoder still produces a finite input space (2^(k*k) bitstrings
+per patch), all input->output mappings are precomputed into a lookup table
+at init (Henderson et al. §3.5). forward() never executes a live circuit —
+it indexes the table — which is the only tractable way to run a
+quanvolution over a 112x112 spatial grid with 64 filters.
+
+Two table-construction modes are supported, both run only at __init__:
+  - qpu_mode=False (default): the unitary U of the random circuit is
+    extracted analytically once per filter and the table is derived as
+    |U|^2.T @ (n - 2*hamming) — fast, noiseless.
+  - qpu_mode=True: the table is built by per-basis-state shot-sampled
+    probability estimates (qpu_shots measurements each), mimicking what
+    a real QPU would produce in expectation. The table values gain
+    ~1/sqrt(qpu_shots) sampling noise but forward() stays a pure lookup,
+    so per-batch cost is unchanged — only construction cost rises (2^k*k
+    circuits per filter). Intended for train-on-sim / eval-on-QPU
+    experiments via the eval_swap pattern in qmedvit-unified.ipynb.
 
 Unlike softmax_only, this variant ignores quantum_stages /
 quantum_block_indices: the quantum op lives in the stem, not in the
@@ -104,6 +129,43 @@ def _build_lookup_table(ops, n_qubits: int, qdevice: str, qbackend: str | None) 
     return torch.from_numpy(table.astype(np.float32))
 
 
+def _build_lookup_table_shots(
+    ops, n_qubits: int, shots: int, qdevice: str, qbackend: str | None
+) -> torch.Tensor:
+    """Shots-sampled variant of _build_lookup_table: prepare each basis input
+    with qml.BasisState, run the same circuit on a shots-based device, and
+    derive sum_i <Z_i> from the sampled probabilities. Same expectation as
+    the analytic table, plus ~1/sqrt(shots) per-entry sampling noise — what
+    a real QPU run would produce in expectation. Init cost is 2^n_qubits
+    circuit invocations per filter (vs. one unitary extraction for the
+    analytic path); amortized at construction, forward stays a pure lookup."""
+    dev_kwargs = {"wires": n_qubits, "shots": shots}
+    if qbackend is not None:
+        dev_kwargs["backend"] = qbackend
+    dev = qml.device(qdevice, **dev_kwargs)
+
+    @qml.qnode(dev, interface=None)
+    def circuit(basis_bits):
+        qml.BasisState(basis_bits, wires=range(n_qubits))
+        _apply_ops(ops)
+        return qml.probs(wires=range(n_qubits))
+
+    dim = 1 << n_qubits
+    hamming = np.array([bin(j).count("1") for j in range(dim)], dtype=np.float64)
+    z_sum_per_basis = n_qubits - 2.0 * hamming  # (D,)
+
+    table = np.empty(dim, dtype=np.float64)
+    for k in range(dim):
+        # PennyLane state-vector convention: wire 0 is MSB of the index k
+        bits = np.array(
+            [(k >> (n_qubits - 1 - i)) & 1 for i in range(n_qubits)],
+            dtype=np.int64,
+        )
+        probs = np.asarray(circuit(bits))       # (D,), sampled empirical distribution
+        table[k] = float(probs @ z_sum_per_basis)
+    return torch.from_numpy(table.astype(np.float32))
+
+
 class QuanvStem(nn.Module):
     def __init__(
         self,
@@ -117,6 +179,8 @@ class QuanvStem(nn.Module):
         seed: int = 0,
         qdevice: str = "default.qubit",
         qbackend: str | None = None,
+        qpu_mode: bool = False,
+        qpu_shots: int = 5000,
     ):
         super().__init__()
         if n_qubits is None:
@@ -132,12 +196,18 @@ class QuanvStem(nn.Module):
         self.stride = stride
         self.padding = padding
         self.n_qubits = n_qubits
+        # Mode stored only for introspection — forward never branches on it.
+        self.qpu_mode = qpu_mode
+        self.qpu_shots = qpu_shots
 
         rng = np.random.default_rng(seed)
         tables = []
         for _ in range(out_channels):
             ops = _sample_circuit_ops(n_qubits, connection_prob, rng)
-            tables.append(_build_lookup_table(ops, n_qubits, qdevice, qbackend))
+            if qpu_mode:
+                tables.append(_build_lookup_table_shots(ops, n_qubits, qpu_shots, qdevice, qbackend))
+            else:
+                tables.append(_build_lookup_table(ops, n_qubits, qdevice, qbackend))
         # (out_channels, 2**n_qubits). Buffer (not Parameter) — quanv is frozen.
         self.register_buffer("lookup", torch.stack(tables, dim=0))
 
@@ -157,13 +227,15 @@ class QuanvStem(nn.Module):
         H_out = (H + 2 * p - k) // s + 1
         W_out = (W + 2 * p - k) // s + 1
 
-        # (B, C*k*k, L) -> per-spatial-cell mean over RGB -> threshold at 0.
-        # Mean-over-channels threshold is the natural extension of the paper's
-        # ">0" scheme to multi-channel inputs (sum>0 is equivalent up to scale).
+        # (B, C*k*k, L) -> per-spatial-cell mean over RGB -> threshold at the
+        # per-patch median (Median Binary Pattern, Hafiane et al. 2007), which
+        # forces ~50/50 bit balance and prevents the bucket collapse a fixed
+        # global threshold suffers on dark medical imagery.
         patches = F.unfold(x, kernel_size=k, stride=s, padding=p)         # (B, C*k*k, L)
         L = patches.shape[-1]
         patches = patches.view(B, C, k * k, L).mean(dim=1)                # (B, k*k, L)
-        bits = (patches > 0).long().transpose(1, 2)                       # (B, L, k*k)
+        median = patches.median(dim=1, keepdim=True).values               # (B, 1, L)
+        bits = (patches > median).long().transpose(1, 2)                  # (B, L, k*k)
         idx = (bits * self.bit_weights).sum(dim=-1)                       # (B, L), in [0, 2**n_qubits)
 
         # Gather one scalar per (filter, patch) from the precomputed table.
@@ -197,6 +269,8 @@ class QMedViT_Quanv_Stem(QMedViT):
             seed=quanv_seed,
             qdevice=self.qdevice,
             qbackend=self.qbackend,
+            qpu_mode=self.qpu_mode,
+            qpu_shots=self.qpu_shots,
         )
 
     def _should_quantize_block(self, block, stage_id, block_idx) -> bool:
