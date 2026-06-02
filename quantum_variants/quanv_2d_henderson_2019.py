@@ -285,6 +285,109 @@ def _build_quanv_circuit(
     return circuit, gate_plan, _apply_random_circuit
 
 
+# ---------------------------------------------------------------------------
+# Module-level LUT helpers (picklable, no `self`) — shared by the sequential
+# and the multiprocessing build paths so the two cannot diverge numerically.
+# ---------------------------------------------------------------------------
+def _eval_qnode_on_unique_mod(qnode, bitstrings_flat: np.ndarray, nq: int, decoding: str) -> np.ndarray:
+    """Evaluate `qnode` on every row of `bitstrings_flat` ([N, nq]), dedup'ing
+    identical rows. Returns [N] (per-patch scalar: mean over qubits of either
+    <Z>-prob-|1> or popcount). Identical logic to Quanv2d._eval_qnode_on_unique.
+    """
+    if bitstrings_flat.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    powers = (1 << np.arange(nq, dtype=np.int64))
+    keys = bitstrings_flat.astype(np.int64) @ powers
+    unique_keys, inverse = np.unique(keys, return_inverse=True)
+
+    unique_bits = np.zeros((unique_keys.shape[0], nq), dtype=np.int64)
+    for j in range(nq):
+        unique_bits[:, j] = (unique_keys >> j) & 1
+
+    unique_scalars = np.empty((unique_keys.shape[0],), dtype=np.float32)
+    if decoding == "expval":
+        for u in range(unique_bits.shape[0]):
+            z_arr = np.asarray(qnode(unique_bits[u]), dtype=np.float64).reshape(-1)
+            unique_scalars[u] = float((0.5 * (1.0 - z_arr)).mean())
+    else:
+        for u in range(unique_bits.shape[0]):
+            samples_arr = np.asarray(qnode(unique_bits[u]), dtype=np.int64)
+            if samples_arr.ndim == 1:
+                samples_arr = samples_arr.reshape(1, -1)
+            popcount = samples_arr.sum(axis=-1).astype(np.float64) / float(nq)
+            unique_scalars[u] = float(popcount.mean())
+
+    return unique_scalars[inverse]
+
+
+def _eval_circuit_batched_mod(body, all_basis: np.ndarray, nq: int, qdevice: str,
+                              qbackend: str | None) -> np.ndarray:
+    """One broadcast QNode call over ALL basis states (expval only). Encodes via
+    RX(pi * bit) (equal to PauliX up to a global phase invisible to <Z>), so the
+    result matches the PauliX-encoded circuit exactly. Identical logic to
+    Quanv2d._eval_circuit_batched.
+    """
+    dev_kwargs = {"wires": nq}  # analytic (no shots) for expval
+    if qbackend is not None:
+        dev_kwargs["backend"] = qbackend
+    dev = qml.device(qdevice, **dev_kwargs)
+
+    @qml.qnode(dev, interface="numpy", diff_method=None)
+    def batched(thetas):
+        for q in range(nq):
+            qml.RX(thetas[:, q], wires=q)
+        body()
+        return [qml.expval(qml.PauliZ(q)) for q in range(nq)]
+
+    thetas = np.pi * all_basis.astype(np.float64)
+    z = np.asarray(batched(thetas), dtype=np.float64).reshape(nq, -1)
+    return (0.5 * (1.0 - z)).mean(axis=0).astype(np.float32)
+
+
+def _lut_row_from_seed(sub_seed: int, nq: int, depth: int, decoding: str, n_shots: int,
+                       connection_prob: float, qdevice: str, qbackend: str | None) -> np.ndarray:
+    """Build ONE frozen circuit from its deterministic sub_seed and return its
+    full 2^nq lookup row. Reconstructing from the seed (rather than receiving the
+    un-picklable QNode/body) is what lets workers run in separate processes while
+    producing values identical to the in-process build.
+    """
+    qnode, _plan, body = _build_quanv_circuit(
+        n_qubits=nq, depth=depth, qdevice=qdevice, qbackend=qbackend,
+        seed=sub_seed, decoding=decoding, n_shots=n_shots, connection_prob=connection_prob,
+    )
+    n_states = 1 << nq
+    all_basis = (
+        (np.arange(n_states, dtype=np.int64)[:, None] >> np.arange(nq, dtype=np.int64)[None, :]) & 1
+    ).astype(np.uint8)
+    if decoding == "expval":
+        try:
+            return _eval_circuit_batched_mod(body, all_basis, nq, qdevice, qbackend)
+        except Exception:
+            pass
+    return _eval_qnode_on_unique_mod(qnode, all_basis, nq, decoding)
+
+
+def _lut_worker_init():
+    """Pool initializer: pin each worker to single-threaded BLAS to avoid
+    oversubscription (N processes each spawning BLAS threads). threadpoolctl
+    reconfigures already-loaded BLAS (works under fork); the env vars help under
+    spawn / for libs that read them lazily."""
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = "1"
+    try:
+        import threadpoolctl
+        threadpoolctl.threadpool_limits(1)
+    except Exception:
+        pass
+
+
+def _lut_worker(args):
+    """Top-level worker (picklable) for multiprocessing.Pool.map."""
+    return _lut_row_from_seed(*args)
+
+
 class Quanv2d(nn.Module):
     """Henderson 2019 quanvolutional layer.
 
@@ -342,6 +445,7 @@ class Quanv2d(nn.Module):
         connection_prob: float = 0.5,
         lut_cache_dir: str | None = None,
         rebuild_lut: bool = False,
+        n_jobs: int = 1,
     ):
         super().__init__()
         if decoding not in ("expval", "counts"):
@@ -370,6 +474,7 @@ class Quanv2d(nn.Module):
             else os.environ.get("QUANV_LUT_CACHE_DIR", self._LUT_CACHE_DIR_DEFAULT)
         )
         self.rebuild_lut = bool(rebuild_lut)
+        self.n_jobs = int(n_jobs)
 
         k = self.kernel_size
         if self.channel_wise:
@@ -484,6 +589,29 @@ class Quanv2d(nn.Module):
             print(f"[Quanv2d] LUT BUILT (cache write failed: {exc!r}).")
         return lut
 
+    def _resolve_n_jobs(self, n_circuits: int) -> int:
+        """Map the sklearn-style n_jobs to an actual worker count: <=0 means all
+        cores; otherwise the requested count, never more than there are circuits.
+        """
+        if self.n_jobs <= 0:
+            return max(1, min(os.cpu_count() or 1, n_circuits))
+        return max(1, min(self.n_jobs, n_circuits))
+
+    def _sub_seeds(self) -> list:
+        """Per-circuit sub_seeds in the SAME nested order __init__ uses (oc-major,
+        then ic for channel_wise), so reconstructed circuits match the stored ones.
+        """
+        if self.channel_wise:
+            return [
+                (self.seed * 1_000_003 + oc * 1009 + ic) & 0x7FFFFFFF
+                for oc in range(self.out_channels)
+                for ic in range(self.in_channels)
+            ]
+        return [
+            (self.seed * 1_000_003 + oc * 1009) & 0x7FFFFFFF
+            for oc in range(self.out_channels)
+        ]
+
     def _build_lut(self) -> torch.Tensor:
         """Evaluate every frozen circuit on all 2^n_qubits basis states once.
 
@@ -492,118 +620,57 @@ class Quanv2d(nn.Module):
         holds the scalar that _eval_qnode_on_unique would produce for the
         bitstring whose packed integer key is `key` (bit j == (key >> j) & 1),
         so the lookup path is numerically identical to the QNode path.
+
+        Circuits are independent, so when n_jobs != 1 they are built in parallel
+        across processes (each reconstructs its circuit from its sub_seed). The
+        parallel and sequential paths call the same `_lut_row_from_seed`, so they
+        produce byte-for-byte identical tables; n_jobs is a build-time detail
+        only and does NOT enter the cache key.
         """
         nq = self.n_qubits
         n_states = 1 << nq
-        # Basis states in key order: row k has bit j == (k >> j) & 1. This is
-        # exactly the packing used by _eval_qnode_on_unique (powers = 1<<arange),
-        # so passing these rows back returns one scalar per key, in key order.
-        ks = np.arange(n_states, dtype=np.int64)
-        bit_idx = np.arange(nq, dtype=np.int64)
-        all_basis = ((ks[:, None] >> bit_idx[None, :]) & 1).astype(np.uint8)
+        sub_seeds = self._sub_seeds()
+        n_circuits = len(sub_seeds)
+        n_workers = self._resolve_n_jobs(n_circuits)
+        args = [
+            (s, nq, self.depth, self.decoding, self.n_shots,
+             self.connection_prob, self.qdevice, self.qbackend)
+            for s in sub_seeds
+        ]
 
-        def scalars_for(qnode, body):
-            # Prompt 2: one broadcast QNode call over all basis states (expval
-            # only); fall back to the per-state loop if the device/decoding
-            # cannot broadcast. Both paths return numerically identical values.
-            if self.decoding == "expval":
-                try:
-                    return self._eval_circuit_batched(body, all_basis)
-                except Exception:
-                    pass
-            return self._eval_qnode_on_unique(qnode, all_basis)
+        print(f"[Quanv2d] building LUT: {n_circuits} circuits on {n_workers} worker(s)")
 
+        rows = None
+        if n_workers > 1:
+            try:
+                import multiprocessing as mp
+                chunksize = max(1, n_circuits // (n_workers * 4))
+                with mp.Pool(processes=n_workers, initializer=_lut_worker_init) as pool:
+                    rows = pool.map(_lut_worker, args, chunksize=chunksize)
+            except Exception as exc:  # spawn/pickle/env issue -> sequential
+                print(f"[Quanv2d] parallel LUT build failed ({exc!r}); "
+                      f"falling back to sequential.")
+                rows = None
+        if rows is None:
+            rows = [_lut_row_from_seed(*a) for a in args]
+
+        stacked = np.stack([np.asarray(r, dtype=np.float32) for r in rows])
         if self.channel_wise:
-            lut = torch.empty(
-                (self.out_channels, self.in_channels, n_states), dtype=torch.float32
-            )
-            for oc in range(self.out_channels):
-                for ic in range(self.in_channels):
-                    scalars = scalars_for(self._qnodes[oc][ic], self._bodies[oc][ic])
-                    lut[oc, ic] = torch.from_numpy(np.asarray(scalars, dtype=np.float32))
+            shape = (self.out_channels, self.in_channels, n_states)
         else:
-            lut = torch.empty((self.out_channels, n_states), dtype=torch.float32)
-            for oc in range(self.out_channels):
-                scalars = scalars_for(self._qnodes[oc], self._bodies[oc])
-                lut[oc] = torch.from_numpy(np.asarray(scalars, dtype=np.float32))
-        return lut
+            shape = (self.out_channels, n_states)
+        return torch.from_numpy(stacked.reshape(shape)).contiguous()
 
     def _eval_circuit_batched(self, body, all_basis: np.ndarray) -> np.ndarray:
-        """Evaluate one circuit on ALL basis states in a single broadcast call.
-
-        Encodes each basis state via RX(pi * bit) instead of a conditional
-        PauliX: on a product basis state this differs only by a global phase
-        (RX(pi)|0> = -i|1>), which leaves every <Z_i> expectation unchanged, so
-        the result matches the PauliX-encoded `circuit` exactly. The RX angle is
-        a broadcastable parameter, so PennyLane runs all 2^nq states at once.
-
-        Returns the same per-state scalar as the expval branch of
-        _eval_qnode_on_unique: mean over qubits of 0.5 * (1 - <Z_i>).
-        """
-        nq = self.n_qubits
-        dev_kwargs = {"wires": nq}  # analytic (no shots) for expval
-        if self.qbackend is not None:
-            dev_kwargs["backend"] = self.qbackend
-        dev = qml.device(self.qdevice, **dev_kwargs)
-
-        @qml.qnode(dev, interface="numpy", diff_method=None)
-        def batched(thetas):
-            for q in range(nq):
-                qml.RX(thetas[:, q], wires=q)
-            body()
-            return [qml.expval(qml.PauliZ(q)) for q in range(nq)]
-
-        thetas = np.pi * all_basis.astype(np.float64)  # [n_states, nq]
-        z = np.asarray(batched(thetas), dtype=np.float64).reshape(nq, -1)  # [nq, n_states]
-        p_one = 0.5 * (1.0 - z)
-        return p_one.mean(axis=0).astype(np.float32)  # [n_states]
+        """Thin instance wrapper around the module-level batched evaluator (the
+        single source of truth shared with the parallel build path)."""
+        return _eval_circuit_batched_mod(body, all_basis, self.n_qubits,
+                                         self.qdevice, self.qbackend)
 
     def _eval_qnode_on_unique(self, qnode, bitstrings_flat: np.ndarray) -> np.ndarray:
-        """Evaluate `qnode` on every row of `bitstrings_flat` (shape [N, nq]),
-        deduplicating identical rows. Returns array of shape [N] (scalar per
-        patch — mean over qubits of either <Z> or popcount).
-        """
-        nq = self.n_qubits
-        if bitstrings_flat.shape[0] == 0:
-            return np.zeros((0,), dtype=np.float32)
-
-        # Pack each bitstring into an integer key for deduplication.
-        powers = (1 << np.arange(nq, dtype=np.int64))
-        keys = bitstrings_flat.astype(np.int64) @ powers
-        unique_keys, inverse = np.unique(keys, return_inverse=True)
-
-        # Reconstruct each unique bitstring.
-        unique_bits = np.zeros((unique_keys.shape[0], nq), dtype=np.int64)
-        for j in range(nq):
-            unique_bits[:, j] = (unique_keys >> j) & 1
-
-        unique_scalars = np.empty((unique_keys.shape[0],), dtype=np.float32)
-        if self.decoding == "expval":
-            # qnode returns a list/tuple of nq scalars; collapse to mean.
-            # Decoded value = mean over qubits of <Z_i>, mapped to [0, 1] via
-            # (1 - <Z>) / 2 (probability of measuring |1>) so the result is a
-            # non-negative pixel-like feature (matches the paper's "fraction
-            # of |1> outcomes" intuition).
-            for u in range(unique_bits.shape[0]):
-                z_vals = qnode(unique_bits[u])
-                z_arr = np.asarray(z_vals, dtype=np.float64).reshape(-1)
-                p_one = 0.5 * (1.0 - z_arr)
-                unique_scalars[u] = float(p_one.mean())
-        else:
-            # counts mode: average popcount over n_shots samples, normalized
-            # by n_qubits. Faithful to Henderson's "decoded as a single scalar
-            # value per output channel" via measurement statistics.
-            # TODO: a per-unique-bitstring shot batching is possible here too,
-            # but kept literal for now.
-            for u in range(unique_bits.shape[0]):
-                samples = qnode(unique_bits[u])
-                samples_arr = np.asarray(samples, dtype=np.int64)
-                if samples_arr.ndim == 1:
-                    samples_arr = samples_arr.reshape(1, -1)
-                popcount = samples_arr.sum(axis=-1).astype(np.float64) / float(nq)
-                unique_scalars[u] = float(popcount.mean())
-
-        return unique_scalars[inverse]
+        """Thin instance wrapper around the module-level per-unique evaluator.
+        Used by the forward fallback path (non-LUT, large n_qubits)."""
+        return _eval_qnode_on_unique_mod(qnode, bitstrings_flat, self.n_qubits, self.decoding)
 
     # ------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -734,6 +801,7 @@ class QuanvConvBNReLU(nn.Module):
         seed: int,
         lut_cache_dir: str | None = None,
         rebuild_lut: bool = False,
+        n_jobs: int = 1,
     ):
         super().__init__()
         # `groups` is part of the ConvBNReLU signature but the stem uses the
@@ -758,6 +826,7 @@ class QuanvConvBNReLU(nn.Module):
             seed=seed,
             lut_cache_dir=lut_cache_dir,
             rebuild_lut=rebuild_lut,
+            n_jobs=n_jobs,
         )
         self.norm = nn.BatchNorm2d(out_channels, eps=NORM_EPS)
         self.act = nn.ReLU(inplace=True)
@@ -786,6 +855,7 @@ class QMedViTHenderson2019(QMedViT):
         quanv_seed: int = 0,
         quanv_lut_cache_dir: str | None = None,
         quanv_rebuild_lut: bool = False,
+        quanv_n_jobs: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -798,6 +868,7 @@ class QMedViTHenderson2019(QMedViT):
         self.quanv_seed = int(quanv_seed)
         self.quanv_lut_cache_dir = quanv_lut_cache_dir
         self.quanv_rebuild_lut = bool(quanv_rebuild_lut)
+        self.quanv_n_jobs = int(quanv_n_jobs)
 
         # Walk self.stem and replace every ConvBNReLU with QuanvConvBNReLU
         # matching its (C_in, C_out, kernel_size, stride).
@@ -825,6 +896,7 @@ class QMedViTHenderson2019(QMedViT):
                     seed=self.quanv_seed + 1000 * idx,
                     lut_cache_dir=self.quanv_lut_cache_dir,
                     rebuild_lut=self.quanv_rebuild_lut,
+                    n_jobs=self.quanv_n_jobs,
                 )
                 new_modules.append(qcbr)
             else:

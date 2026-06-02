@@ -32,6 +32,11 @@ wandb/
 lightning_logs/
 mlruns/
 
+# Pre-built Henderson quanvolutional LUTs (small, ~17 MB; intentionally tracked
+# so Kaggle can load them instead of rebuilding — overrides the *.pt rule above)
+!.quanv_cache/
+!.quanv_cache/*.pt
+
 # Datasets cached locally
 *.npz
 *.h5
