@@ -45,6 +45,8 @@ NISQ-feasible compromise documented here as a deviation from the literal paper;
 the literal C_in*k*k case is available via `channel_wise=False`.
 """
 
+import hashlib
+import os
 from functools import partial
 
 import numpy as np
@@ -276,7 +278,11 @@ def _build_quanv_circuit(
             # downstream collapses samples to a mean popcount scalar.
             return qml.sample(wires=range(n_qubits))
 
-    return circuit, gate_plan
+    # `_apply_random_circuit` (the frozen body, WITHOUT encoding/measurement) is
+    # returned so callers can build a broadcasting QNode for fast LUT
+    # construction (see Quanv2d._build_lut). It captures the same gate_plan and
+    # SqrtSWAP fallback, guaranteeing identical gates to `circuit`.
+    return circuit, gate_plan, _apply_random_circuit
 
 
 class Quanv2d(nn.Module):
@@ -294,7 +300,29 @@ class Quanv2d(nn.Module):
           mapping and call the QNode once per *unique* bitstring observed in a
           forward, then scatter results back — a major speedup vs. one QNode
           call per patch.
+        * Because the circuits are FROZEN and the input is always a
+          computational basis state (threshold encoding -> PauliX), each circuit
+          is a deterministic function of just 2^n_qubits possible bitstrings.
+          When n_qubits is small enough (<= _LUT_MAX_QUBITS, i.e. channel_wise),
+          we precompute the full lookup table ONCE at __init__ and the forward
+          becomes pure tensor indexing — no QNode calls in the hot path. The
+          table is a registered buffer (moves to GPU with the model, persists in
+          state_dict). For large n_qubits (the literal non-channel_wise case) the
+          table is infeasible, so `self._lut is None` and forward falls back to
+          the per-unique-bitstring QNode path.
     """
+
+    # 2^n_qubits entries per circuit; above this the lookup table is infeasible
+    # (memory + build time) and we fall back to the QNode path.
+    _LUT_MAX_QUBITS = 16
+
+    # Bump whenever the LUT-construction logic changes in a way that alters its
+    # values; old on-disk caches with a different version are ignored.
+    _LUT_BUILD_VERSION = 1
+
+    # Default cache directory; overridable per-instance via `lut_cache_dir` or
+    # globally via the QUANV_LUT_CACHE_DIR environment variable.
+    _LUT_CACHE_DIR_DEFAULT = ".quanv_cache"
 
     def __init__(
         self,
@@ -312,6 +340,8 @@ class Quanv2d(nn.Module):
         qbackend: str | None = None,
         seed: int = 0,
         connection_prob: float = 0.5,
+        lut_cache_dir: str | None = None,
+        rebuild_lut: bool = False,
     ):
         super().__init__()
         if decoding not in ("expval", "counts"):
@@ -333,6 +363,13 @@ class Quanv2d(nn.Module):
         self.qbackend = qbackend
         self.seed = int(seed)
         self.connection_prob = float(connection_prob)
+        # Env var overrides the constructor default; explicit arg wins over both.
+        self.lut_cache_dir = (
+            lut_cache_dir
+            if lut_cache_dir is not None
+            else os.environ.get("QUANV_LUT_CACHE_DIR", self._LUT_CACHE_DIR_DEFAULT)
+        )
+        self.rebuild_lut = bool(rebuild_lut)
 
         k = self.kernel_size
         if self.channel_wise:
@@ -340,12 +377,14 @@ class Quanv2d(nn.Module):
             # Per (output, input) channel circuit, summed over input channels.
             self._qnodes = []
             self._gate_plans = []
+            self._bodies = []
             for oc in range(out_channels):
                 row_qnodes = []
                 row_plans = []
+                row_bodies = []
                 for ic in range(in_channels):
                     sub_seed = (self.seed * 1_000_003 + oc * 1009 + ic) & 0x7FFFFFFF
-                    qnode, plan = _build_quanv_circuit(
+                    qnode, plan, body = _build_quanv_circuit(
                         n_qubits=self.n_qubits,
                         depth=self.depth,
                         qdevice=self.qdevice,
@@ -357,15 +396,18 @@ class Quanv2d(nn.Module):
                     )
                     row_qnodes.append(qnode)
                     row_plans.append(plan)
+                    row_bodies.append(body)
                 self._qnodes.append(row_qnodes)
                 self._gate_plans.append(row_plans)
+                self._bodies.append(row_bodies)
         else:
             self.n_qubits = in_channels * k * k
             self._qnodes = []
             self._gate_plans = []
+            self._bodies = []
             for oc in range(out_channels):
                 sub_seed = (self.seed * 1_000_003 + oc * 1009) & 0x7FFFFFFF
-                qnode, plan = _build_quanv_circuit(
+                qnode, plan, body = _build_quanv_circuit(
                     n_qubits=self.n_qubits,
                     depth=self.depth,
                     qdevice=self.qdevice,
@@ -377,8 +419,145 @@ class Quanv2d(nn.Module):
                 )
                 self._qnodes.append(qnode)
                 self._gate_plans.append(plan)
+                self._bodies.append(body)
+
+        # Precompute the per-circuit lookup table when feasible. The forward
+        # then never touches a QNode (see _forward_lut). Registered as a buffer
+        # so it follows the model to GPU and round-trips through state_dict.
+        if self.n_qubits <= self._LUT_MAX_QUBITS:
+            self.register_buffer("_lut", self._load_or_build_lut())
+        else:
+            self.register_buffer("_lut", None)
 
     # ------------------------------------------------------------------ helpers
+    def _lut_cache_key(self) -> str:
+        """Stable hash over everything the LUT values depend on.
+
+        The table is a frozen function of the circuit configuration only (not of
+        any input data), so any two layers sharing these fields produce byte-for
+        -byte identical tables and can share a cache file.
+        """
+        payload = "|".join(
+            str(v)
+            for v in (
+                self._LUT_BUILD_VERSION,
+                self.seed,
+                self.n_qubits,
+                self.kernel_size,
+                self.in_channels,
+                self.out_channels,
+                self.channel_wise,
+                self.depth,
+                self.decoding,
+                self.n_shots,
+                self.connection_prob,
+                self.qdevice,
+                self.qbackend,
+            )
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _load_or_build_lut(self) -> torch.Tensor:
+        """Return the LUT, loading it from disk when a matching cache exists.
+
+        Cache hit  -> torch.load (CPU), no PennyLane calls at all.
+        Cache miss -> build (batched where possible), then torch.save.
+        `rebuild_lut=True` ignores any existing cache and forces a rebuild.
+        """
+        key = self._lut_cache_key()
+        cache_path = os.path.join(self.lut_cache_dir, f"quanv_lut_{key}.pt")
+
+        if not self.rebuild_lut and os.path.isfile(cache_path):
+            try:
+                lut = torch.load(cache_path, map_location="cpu")
+                print(f"[Quanv2d] LUT LOADED from cache: {cache_path}")
+                return lut
+            except Exception as exc:  # corrupt/incompatible file -> rebuild
+                print(f"[Quanv2d] LUT cache unreadable ({exc!r}); rebuilding.")
+
+        lut = self._build_lut()
+        try:
+            os.makedirs(self.lut_cache_dir, exist_ok=True)
+            torch.save(lut, cache_path)
+            print(f"[Quanv2d] LUT BUILT and cached: {cache_path}")
+        except Exception as exc:  # caching is best-effort; never fail the build
+            print(f"[Quanv2d] LUT BUILT (cache write failed: {exc!r}).")
+        return lut
+
+    def _build_lut(self) -> torch.Tensor:
+        """Evaluate every frozen circuit on all 2^n_qubits basis states once.
+
+        Returns a float32 tensor of shape [out_channels, in_channels, 2^nq]
+        (channel_wise) or [out_channels, 2^nq] (literal). Entry `[..., key]`
+        holds the scalar that _eval_qnode_on_unique would produce for the
+        bitstring whose packed integer key is `key` (bit j == (key >> j) & 1),
+        so the lookup path is numerically identical to the QNode path.
+        """
+        nq = self.n_qubits
+        n_states = 1 << nq
+        # Basis states in key order: row k has bit j == (k >> j) & 1. This is
+        # exactly the packing used by _eval_qnode_on_unique (powers = 1<<arange),
+        # so passing these rows back returns one scalar per key, in key order.
+        ks = np.arange(n_states, dtype=np.int64)
+        bit_idx = np.arange(nq, dtype=np.int64)
+        all_basis = ((ks[:, None] >> bit_idx[None, :]) & 1).astype(np.uint8)
+
+        def scalars_for(qnode, body):
+            # Prompt 2: one broadcast QNode call over all basis states (expval
+            # only); fall back to the per-state loop if the device/decoding
+            # cannot broadcast. Both paths return numerically identical values.
+            if self.decoding == "expval":
+                try:
+                    return self._eval_circuit_batched(body, all_basis)
+                except Exception:
+                    pass
+            return self._eval_qnode_on_unique(qnode, all_basis)
+
+        if self.channel_wise:
+            lut = torch.empty(
+                (self.out_channels, self.in_channels, n_states), dtype=torch.float32
+            )
+            for oc in range(self.out_channels):
+                for ic in range(self.in_channels):
+                    scalars = scalars_for(self._qnodes[oc][ic], self._bodies[oc][ic])
+                    lut[oc, ic] = torch.from_numpy(np.asarray(scalars, dtype=np.float32))
+        else:
+            lut = torch.empty((self.out_channels, n_states), dtype=torch.float32)
+            for oc in range(self.out_channels):
+                scalars = scalars_for(self._qnodes[oc], self._bodies[oc])
+                lut[oc] = torch.from_numpy(np.asarray(scalars, dtype=np.float32))
+        return lut
+
+    def _eval_circuit_batched(self, body, all_basis: np.ndarray) -> np.ndarray:
+        """Evaluate one circuit on ALL basis states in a single broadcast call.
+
+        Encodes each basis state via RX(pi * bit) instead of a conditional
+        PauliX: on a product basis state this differs only by a global phase
+        (RX(pi)|0> = -i|1>), which leaves every <Z_i> expectation unchanged, so
+        the result matches the PauliX-encoded `circuit` exactly. The RX angle is
+        a broadcastable parameter, so PennyLane runs all 2^nq states at once.
+
+        Returns the same per-state scalar as the expval branch of
+        _eval_qnode_on_unique: mean over qubits of 0.5 * (1 - <Z_i>).
+        """
+        nq = self.n_qubits
+        dev_kwargs = {"wires": nq}  # analytic (no shots) for expval
+        if self.qbackend is not None:
+            dev_kwargs["backend"] = self.qbackend
+        dev = qml.device(self.qdevice, **dev_kwargs)
+
+        @qml.qnode(dev, interface="numpy", diff_method=None)
+        def batched(thetas):
+            for q in range(nq):
+                qml.RX(thetas[:, q], wires=q)
+            body()
+            return [qml.expval(qml.PauliZ(q)) for q in range(nq)]
+
+        thetas = np.pi * all_basis.astype(np.float64)  # [n_states, nq]
+        z = np.asarray(batched(thetas), dtype=np.float64).reshape(nq, -1)  # [nq, n_states]
+        p_one = 0.5 * (1.0 - z)
+        return p_one.mean(axis=0).astype(np.float32)  # [n_states]
+
     def _eval_qnode_on_unique(self, qnode, bitstrings_flat: np.ndarray) -> np.ndarray:
         """Evaluate `qnode` on every row of `bitstrings_flat` (shape [N, nq]),
         deduplicating identical rows. Returns array of shape [N] (scalar per
@@ -448,10 +627,15 @@ class Quanv2d(nn.Module):
         W_o = (W + 2 * p - k) // s + 1
         assert L == H_o * W_o, f"unfold length mismatch: {L} vs {H_o * W_o}"
 
-        # Threshold encoding -> {0, 1} bitstrings. We deliberately .detach()
-        # before doing the numpy round-trip; the quanv layer is non-trainable
-        # and gradient flow stops here (the threshold itself is non-diff).
+        # Threshold encoding -> {0, 1} bitstrings. We deliberately .detach();
+        # the quanv layer is non-trainable and gradient flow stops here (the
+        # threshold itself is non-diff).
         bits = (patches.detach() > self.threshold).to(torch.uint8)
+
+        # Fast path: precomputed lookup table -> pure tensor indexing, no QNode.
+        if self._lut is not None:
+            return self._forward_lut(bits, B, C, H_o, W_o, L, x)
+
         bits_np = bits.cpu().numpy()  # [B, C*k*k, L]
 
         out = torch.zeros((B, self.out_channels, H_o, W_o), dtype=x.dtype, device=x.device)
@@ -480,6 +664,49 @@ class Quanv2d(nn.Module):
 
         return out
 
+    def _forward_lut(self, bits: torch.Tensor, B, C, H_o, W_o, L, x) -> torch.Tensor:
+        """Lookup-table forward: identical math to the QNode path, but the
+        per-patch scalar is read from self._lut instead of evaluating circuits.
+
+        Runs ENTIRELY in torch on x.device — no .cpu()/.numpy() and no
+        host<->device copy. self._lut is a registered buffer, so it already
+        lives on the model's device (moves with .cuda()); `bits` was computed
+        from x in forward and is likewise on x.device. The quanv block stays
+        non-trainable: `bits` derives from x.detach() and the table is a
+        non-learnable buffer, so no gradient flows through here.
+
+        Mirrors the index ordering of the QNode path exactly:
+          * the k*k (or C*k*k) bits of a patch are packed with powers 2^j,
+            matching _eval_qnode_on_unique's `keys = bits @ (1<<arange(nq))`;
+          * channel_wise sums the per-input-channel scalars, matching the `acc`
+            accumulation in the QNode path.
+        """
+        nq = self.n_qubits
+        device = x.device
+        # `bits` is already on x.device; only an integer cast is needed for key
+        # packing (no device move). powers/keys/gather all stay on x.device.
+        bits = bits.to(torch.long)  # [B, C*k*k, L]
+        powers = 2 ** torch.arange(nq, device=device, dtype=torch.long)
+
+        if self.channel_wise:
+            # [B, C, k*k, L] — same split as bits_np.reshape(B, C, k*k, L).
+            bits_chan = bits.view(B, C, nq, L)
+            keys = (bits_chan * powers.view(1, 1, nq, 1)).sum(dim=2)  # [B, C, L]
+            acc = torch.zeros(
+                (B, self.out_channels, L), dtype=self._lut.dtype, device=device
+            )
+            for ic in range(self.in_channels):
+                lut_ic = self._lut[:, ic, :]          # [out_channels, 2^nq]
+                gathered = lut_ic[:, keys[:, ic, :]]  # [out_channels, B, L]
+                acc += gathered.permute(1, 0, 2)      # [B, out_channels, L]
+            out = acc.view(B, self.out_channels, H_o, W_o)
+        else:
+            keys = (bits * powers.view(1, nq, 1)).sum(dim=1)  # [B, L]
+            gathered = self._lut[:, keys]                     # [out_channels, B, L]
+            out = gathered.permute(1, 0, 2).reshape(B, self.out_channels, H_o, W_o)
+
+        return out.to(dtype=x.dtype)  # already on x.device; dtype-only cast
+
 
 class QuanvConvBNReLU(nn.Module):
     """ConvBNReLU clone with the inner Conv2d swapped for Quanv2d.
@@ -505,6 +732,8 @@ class QuanvConvBNReLU(nn.Module):
         qdevice: str,
         qbackend: str | None,
         seed: int,
+        lut_cache_dir: str | None = None,
+        rebuild_lut: bool = False,
     ):
         super().__init__()
         # `groups` is part of the ConvBNReLU signature but the stem uses the
@@ -527,6 +756,8 @@ class QuanvConvBNReLU(nn.Module):
             qdevice=qdevice,
             qbackend=qbackend,
             seed=seed,
+            lut_cache_dir=lut_cache_dir,
+            rebuild_lut=rebuild_lut,
         )
         self.norm = nn.BatchNorm2d(out_channels, eps=NORM_EPS)
         self.act = nn.ReLU(inplace=True)
@@ -553,6 +784,8 @@ class QMedViTHenderson2019(QMedViT):
         quanv_n_shots: int = 0,
         quanv_channel_wise: bool = True,
         quanv_seed: int = 0,
+        quanv_lut_cache_dir: str | None = None,
+        quanv_rebuild_lut: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -563,6 +796,8 @@ class QMedViTHenderson2019(QMedViT):
         self.quanv_n_shots = int(quanv_n_shots)
         self.quanv_channel_wise = bool(quanv_channel_wise)
         self.quanv_seed = int(quanv_seed)
+        self.quanv_lut_cache_dir = quanv_lut_cache_dir
+        self.quanv_rebuild_lut = bool(quanv_rebuild_lut)
 
         # Walk self.stem and replace every ConvBNReLU with QuanvConvBNReLU
         # matching its (C_in, C_out, kernel_size, stride).
@@ -588,6 +823,8 @@ class QMedViTHenderson2019(QMedViT):
                     qdevice=self.qdevice,
                     qbackend=self.qbackend,
                     seed=self.quanv_seed + 1000 * idx,
+                    lut_cache_dir=self.quanv_lut_cache_dir,
+                    rebuild_lut=self.quanv_rebuild_lut,
                 )
                 new_modules.append(qcbr)
             else:
