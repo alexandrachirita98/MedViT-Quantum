@@ -340,36 +340,50 @@ class TrainableQuanv2d(nn.Module):
         `angles_batch` has shape `[N, n_qubits]` (already rescaled to [0, π]).
         `params` has shape `[n_ansatz_layers, n_params_per_layer]` (the
         per-output-channel slice).
+
+        PennyLane's `default.qubit` keeps its state vector on CPU. When the
+        model is on a CUDA device the caller's tensors live there too; we
+        round-trip through CPU for the QNode call and move the result back.
+        PyTorch's autograd handles the cross-device transitions automatically
+        via `.cpu()` / `.to(device)`, so gradient flow into `self.angles` and
+        upstream tensors is preserved.
         """
+        orig_device = angles_batch.device
+        if orig_device.type != "cpu":
+            angles_batch = angles_batch.cpu()
+            params = params.cpu()
+
         path = self._vec_path
         if path == "a":
             # Parameter broadcasting: pass the [N, n_qubits] tensor straight in.
             z_list = self._qnode(angles_batch, params)
             # z_list is a length-n_qubits list/tuple of [N] tensors; stack.
             z = torch.stack([z_q.reshape(-1) for z_q in z_list], dim=-1)
-            return z
-        if path == "b":
+        elif path == "b":
             # torch.vmap over the patch dim. The QNode treats `angles` as a
             # flat length-n_qubits vector; vmap maps over axis 0.
             vmapped = torch.vmap(lambda a: torch.stack(
                 [z for z in self._qnode(a, params)]
             ))
-            return vmapped(angles_batch)
-        # Path (c): qml.qnn.TorchLayer wraps the QNode and treats `params` as
-        # the registered "weights" input; we sidestep its weight handling by
-        # constructing a thin TorchLayer wrapper here per call.
-        # (Inefficient but correct; this path is only reached on very old
-        # PennyLane without parameter broadcasting and without torch.vmap.)
-        weight_shapes = {"params": tuple(params.shape)}
-        layer = qml.qnn.TorchLayer(self._qnode, weight_shapes)
-        # TorchLayer keeps its OWN copy of "params" — overwrite with ours so
-        # gradients flow back to self.angles via the assignment.
-        with torch.no_grad():
-            layer.params.copy_(params)
-        # TorchLayer iterates over batch dim internally.
-        outputs = layer(angles_batch)
-        # Outputs shape: [N, n_qubits] for length-n_qubits expval list.
-        return outputs
+            z = vmapped(angles_batch)
+        else:
+            # Path (c): qml.qnn.TorchLayer wraps the QNode and treats `params`
+            # as the registered "weights" input; we sidestep its weight
+            # handling by constructing a thin TorchLayer wrapper here per
+            # call. Inefficient but correct; only reached on very old
+            # PennyLane without parameter broadcasting and without torch.vmap.
+            weight_shapes = {"params": tuple(params.shape)}
+            layer = qml.qnn.TorchLayer(self._qnode, weight_shapes)
+            # TorchLayer keeps its OWN copy of "params" — overwrite with ours
+            # so gradients flow back to self.angles via the assignment.
+            with torch.no_grad():
+                layer.params.copy_(params)
+            # TorchLayer iterates over batch dim internally.
+            z = layer(angles_batch)
+
+        if z.device != orig_device:
+            z = z.to(orig_device)
+        return z
 
     # ------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:
