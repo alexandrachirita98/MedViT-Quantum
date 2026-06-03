@@ -251,6 +251,7 @@ class TrainableQuanv2d(nn.Module):
         n_ansatz_layers: int = 2,
         qdevice: str = "default.qubit",
         qbackend: str | None = None,
+        qnode_chunk_size: int = 2048,
     ):
         super().__init__()
         if ansatz not in _PARAMS_PER_LAYER:
@@ -267,6 +268,14 @@ class TrainableQuanv2d(nn.Module):
         self.n_ansatz_layers = int(n_ansatz_layers)
         self.qdevice = qdevice
         self.qbackend = qbackend
+        # Patches-per-QNode-call cap to bound peak memory. PennyLane's
+        # broadcasted simulation allocates intermediate statevectors of shape
+        # [N, 2^n_qubits] in complex128; for n_qubits=9 each chunk uses
+        # ~chunk_size * 8KB per gate, and the autograd graph retains several
+        # such intermediates. 2048 keeps a single chunk under ~16MB, so even
+        # ~8000 QNode calls per forward (full stem) fit comfortably in RAM.
+        # Set to 0 to disable chunking (single huge call — original behavior).
+        self.qnode_chunk_size = int(qnode_chunk_size)
 
         k = self.kernel_size
         # Number of qubits = patch size (depthwise; Hur uses the same
@@ -353,37 +362,54 @@ class TrainableQuanv2d(nn.Module):
             angles_batch = angles_batch.cpu()
             params = params.cpu()
 
+        # Chunk the patch dimension to bound peak memory. Without this,
+        # PennyLane's broadcasted simulation allocates ~N*2^n_qubits complex
+        # intermediates per gate, which OOMs for typical stem inputs
+        # (e.g. N=125,440 patches at 224x224 stride=2).
+        N = angles_batch.shape[0]
+        chunk = self.qnode_chunk_size if self.qnode_chunk_size > 0 else N
+        outputs = []
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            sub = angles_batch[start:end]
+            outputs.append(self._run_qnode_on_chunk(sub, params))
+        z = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
+
+        if z.device != orig_device:
+            z = z.to(orig_device)
+        return z
+
+    def _run_qnode_on_chunk(self, angles_chunk: torch.Tensor,
+                            params: torch.Tensor) -> torch.Tensor:
+        """Run the QNode on ONE chunk of patches via the selected
+        vectorization path. Returns a tensor of shape [chunk_size, n_qubits].
+        """
         path = self._vec_path
         if path == "a":
             # Parameter broadcasting: pass the [N, n_qubits] tensor straight in.
-            z_list = self._qnode(angles_batch, params)
+            z_list = self._qnode(angles_chunk, params)
             # z_list is a length-n_qubits list/tuple of [N] tensors; stack.
-            z = torch.stack([z_q.reshape(-1) for z_q in z_list], dim=-1)
-        elif path == "b":
+            return torch.stack([z_q.reshape(-1) for z_q in z_list], dim=-1)
+        if path == "b":
             # torch.vmap over the patch dim. The QNode treats `angles` as a
             # flat length-n_qubits vector; vmap maps over axis 0.
             vmapped = torch.vmap(lambda a: torch.stack(
                 [z for z in self._qnode(a, params)]
             ))
-            z = vmapped(angles_batch)
-        else:
-            # Path (c): qml.qnn.TorchLayer wraps the QNode and treats `params`
-            # as the registered "weights" input; we sidestep its weight
-            # handling by constructing a thin TorchLayer wrapper here per
-            # call. Inefficient but correct; only reached on very old
-            # PennyLane without parameter broadcasting and without torch.vmap.
-            weight_shapes = {"params": tuple(params.shape)}
-            layer = qml.qnn.TorchLayer(self._qnode, weight_shapes)
-            # TorchLayer keeps its OWN copy of "params" — overwrite with ours
-            # so gradients flow back to self.angles via the assignment.
-            with torch.no_grad():
-                layer.params.copy_(params)
-            # TorchLayer iterates over batch dim internally.
-            z = layer(angles_batch)
-
-        if z.device != orig_device:
-            z = z.to(orig_device)
-        return z
+            return vmapped(angles_chunk)
+        # Path (c): qml.qnn.TorchLayer wraps the QNode and treats `params`
+        # as the registered "weights" input; we sidestep its weight
+        # handling by constructing a thin TorchLayer wrapper here per
+        # call. Inefficient but correct; only reached on very old
+        # PennyLane without parameter broadcasting and without torch.vmap.
+        weight_shapes = {"params": tuple(params.shape)}
+        layer = qml.qnn.TorchLayer(self._qnode, weight_shapes)
+        # TorchLayer keeps its OWN copy of "params" — overwrite with ours
+        # so gradients flow back to self.angles via the assignment.
+        with torch.no_grad():
+            layer.params.copy_(params)
+        # TorchLayer iterates over batch dim internally.
+        return layer(angles_chunk)
 
     # ------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -466,6 +492,7 @@ class HurConvBNReLU(nn.Module):
         n_ansatz_layers: int,
         qdevice: str,
         qbackend: str | None,
+        qnode_chunk_size: int = 2048,
     ):
         super().__init__()
         # The stem uses groups=1 everywhere (MedViT.py:425-428); the quanv
@@ -483,6 +510,7 @@ class HurConvBNReLU(nn.Module):
             n_ansatz_layers=n_ansatz_layers,
             qdevice=qdevice,
             qbackend=qbackend,
+            qnode_chunk_size=qnode_chunk_size,
         )
         self.norm = nn.BatchNorm2d(out_channels, eps=NORM_EPS)
         self.act = nn.ReLU(inplace=True)
@@ -506,6 +534,7 @@ class QMedViTHur2022(QMedViT):
         ansatz: str = "circuit_2",
         n_ansatz_layers: int = 2,
         qdevice: str = "default.qubit",
+        qnode_chunk_size: int = 2048,
         **kwargs,
     ):
         # Let `qdevice` (and inherited `qbackend`) flow through QMedViT.
@@ -514,6 +543,7 @@ class QMedViTHur2022(QMedViT):
 
         self.hur_ansatz = ansatz
         self.hur_n_ansatz_layers = int(n_ansatz_layers)
+        self.hur_qnode_chunk_size = int(qnode_chunk_size)
 
         # Walk self.stem and replace every ConvBNReLU with HurConvBNReLU
         # matching its (C_in, C_out, kernel_size, stride).
@@ -534,6 +564,7 @@ class QMedViTHur2022(QMedViT):
                     n_ansatz_layers=self.hur_n_ansatz_layers,
                     qdevice=self.qdevice,
                     qbackend=self.qbackend,
+                    qnode_chunk_size=self.hur_qnode_chunk_size,
                 )
                 new_modules.append(hcbr)
             else:
