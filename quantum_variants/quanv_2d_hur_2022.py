@@ -535,6 +535,7 @@ class QMedViTHur2022(QMedViT):
         n_ansatz_layers: int = 2,
         qdevice: str = "default.qubit",
         qnode_chunk_size: int = 2048,
+        quantum_layer_indices: list[int] | None = None,
         **kwargs,
     ):
         # Let `qdevice` (and inherited `qbackend`) flow through QMedViT.
@@ -544,12 +545,18 @@ class QMedViTHur2022(QMedViT):
         self.hur_ansatz = ansatz
         self.hur_n_ansatz_layers = int(n_ansatz_layers)
         self.hur_qnode_chunk_size = int(qnode_chunk_size)
+        # Stem-layer indices selected for quantum replacement. `None` =
+        # replace every ConvBNReLU (legacy behavior).
+        self.hur_quantum_layer_indices = quantum_layer_indices
 
         # Walk self.stem and replace every ConvBNReLU with HurConvBNReLU
         # matching its (C_in, C_out, kernel_size, stride).
         new_modules = []
         for idx, module in enumerate(self.stem):
             if isinstance(module, ConvBNReLU):
+                if quantum_layer_indices is not None and idx not in quantum_layer_indices:
+                    new_modules.append(module)   # keep classical
+                    continue
                 c_in = module.conv.in_channels
                 c_out = module.conv.out_channels
                 ks = module.conv.kernel_size[0]
