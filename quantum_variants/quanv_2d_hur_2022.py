@@ -49,10 +49,20 @@ parameter count is therefore `C_out * n_ansatz_layers * n_params_per_layer`,
 NOT multiplied by C_in.
 
 Training mechanism:
-  * QNode uses `interface="torch"` and `diff_method="backprop"` — analytic
-    state-vector backprop is the fastest path for simulation. Real-hardware
-    deployment would switch to `diff_method="parameter-shift"`; this is
-    documented but NOT required.
+  * QNode uses `interface="torch"`. The differentiation method is chosen
+    automatically from the resolved PennyLane device: `"adjoint"` for the
+    Lightning simulators (`lightning.gpu`, `lightning.qubit`) which do NOT
+    support `"backprop"`, and `"backprop"` for `default.qubit` which is the
+    fastest path on that device for simulation. Real-hardware deployment
+    would switch to `diff_method="parameter-shift"`; this is documented but
+    NOT required.
+  * Device resolution with auto-fallback: the requested `qdevice` is tried
+    first and, on failure, the module walks the chain
+    `lightning.gpu -> lightning.qubit -> default.qubit` starting from the
+    requested device's position. This lets users default to `lightning.gpu`
+    on the configuration side while still running on CPU-only environments
+    (e.g. Colab without CUDA toolkit / cuQuantum) — the model prints a
+    fallback message at construction time and continues without raising.
   * Ansatz angles are stored as
         nn.Parameter(torch.randn(C_out, n_ansatz_layers, n_params_per_layer) * 0.1)
     small init to avoid barren plateau (Hur §IV briefly discusses barren
@@ -177,6 +187,64 @@ _ANSATZ_FNS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Device resolution + diff_method selection helpers.
+# ---------------------------------------------------------------------------
+# `lightning.qubit` is PennyLane's C++ CPU statevector simulator and
+# `lightning.gpu` is the CUDA / cuQuantum-backed GPU statevector simulator.
+# Both are typically faster than `default.qubit` but they do NOT support
+# `diff_method="backprop"` — `"adjoint"` is the supported analytic-gradient
+# path for Lightning. `default.qubit` keeps state on CPU and is the historical
+# default; we fall back to it last to guarantee correctness on any install.
+
+
+def _resolve_qdevice(requested: str, n_qubits: int, verbose: bool = True):
+    """Try the requested PennyLane device. If it fails to load, fall back
+    along the chain `lightning.gpu -> lightning.qubit -> default.qubit`,
+    starting from the requested device's position in that chain.
+
+    Returns ``(resolved_name, device_instance)``.
+
+    Any device NAME not in the chain is treated as opaque: we attempt to
+    instantiate it directly and let PennyLane raise if it is not installed,
+    rather than silently swapping it for a different simulator.
+    """
+    fallback_order = ["lightning.gpu", "lightning.qubit", "default.qubit"]
+    if requested not in fallback_order:
+        return requested, qml.device(requested, wires=n_qubits)
+    start = fallback_order.index(requested)
+    last_err = None
+    for name in fallback_order[start:]:
+        try:
+            dev = qml.device(name, wires=n_qubits)
+            if verbose and name != requested:
+                print(
+                    f"[Hur2022] requested qdevice={requested!r}, falling back "
+                    f"to {name!r} ({type(last_err).__name__}: {last_err})"
+                )
+            elif verbose:
+                print(f"[Hur2022] using qdevice={name!r}")
+            return name, dev
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"All device fallbacks failed (last error: {last_err})"
+    )
+
+
+def _diff_method_for(device_name: str) -> str:
+    """Pick the PennyLane `diff_method` for a resolved device name.
+
+    Lightning devices (`lightning.qubit`, `lightning.gpu`) do not support
+    `"backprop"` — they expose the adjoint method instead. `default.qubit`
+    keeps the historical `"backprop"` path.
+    """
+    if device_name in ("lightning.qubit", "lightning.gpu"):
+        return "adjoint"
+    return "backprop"
+
+
 def _build_hur_qnode(n_qubits: int, ansatz: str, n_ansatz_layers: int,
                      qdevice: str, qbackend: str | None):
     """Construct the trainable Hur 2022 quanvolutional QNode.
@@ -187,8 +255,16 @@ def _build_hur_qnode(n_qubits: int, ansatz: str, n_ansatz_layers: int,
       * `params` is the ansatz parameter tensor of shape
         `[n_ansatz_layers, n_params_per_layer]`.
 
-    Returns a Torch-differentiable QNode that produces per-qubit <Z>
-    expectations (a length-`n_qubits` list).
+    The PennyLane device is resolved via `_resolve_qdevice` (which falls back
+    along `lightning.gpu -> lightning.qubit -> default.qubit` if the
+    requested simulator is unavailable). The differentiation method is then
+    chosen by `_diff_method_for`: `"adjoint"` for Lightning, `"backprop"` for
+    `default.qubit`.
+
+    Returns ``(resolved_name, qnode)`` where `resolved_name` is the actual
+    device name in use (after any fallback) and `qnode` is a
+    Torch-differentiable QNode that produces per-qubit <Z> expectations (a
+    length-`n_qubits` list).
     """
     if ansatz not in _ANSATZ_FNS:
         raise ValueError(
@@ -196,12 +272,21 @@ def _build_hur_qnode(n_qubits: int, ansatz: str, n_ansatz_layers: int,
         )
     apply_layer = _ANSATZ_FNS[ansatz]
 
-    dev_kwargs = {"wires": n_qubits}
-    if qbackend is not None:
-        dev_kwargs["backend"] = qbackend
-    dev = qml.device(qdevice, **dev_kwargs)
+    # NOTE: `qbackend` is intentionally ignored when using Lightning / device
+    # resolution because the lightning.* devices do not take a `backend=`
+    # kwarg. If the caller passed `qbackend` AND a non-fallback-chain device
+    # name, we instantiate via the legacy path that honours `backend`.
+    if qbackend is not None and qdevice not in (
+        "lightning.gpu", "lightning.qubit", "default.qubit"
+    ):
+        dev = qml.device(qdevice, wires=n_qubits, backend=qbackend)
+        resolved_name = qdevice
+    else:
+        resolved_name, dev = _resolve_qdevice(qdevice, n_qubits, verbose=True)
 
-    @qml.qnode(dev, interface="torch", diff_method="backprop")
+    diff_method = _diff_method_for(resolved_name)
+
+    @qml.qnode(dev, interface="torch", diff_method=diff_method)
     def circuit(angles, params):
         # Angle encoding (Hur §IIC2, Eq. 3). Under PennyLane parameter
         # broadcasting, `angles[..., q]` may be a batched tensor; RY accepts
@@ -214,7 +299,7 @@ def _build_hur_qnode(n_qubits: int, ansatz: str, n_ansatz_layers: int,
             apply_layer(params[layer_idx], n_qubits)
         return [qml.expval(qml.PauliZ(q)) for q in range(n_qubits)]
 
-    return circuit
+    return resolved_name, circuit
 
 
 class TrainableQuanv2d(nn.Module):
@@ -251,7 +336,7 @@ class TrainableQuanv2d(nn.Module):
         n_ansatz_layers: int = 2,
         qdevice: str = "default.qubit",
         qbackend: str | None = None,
-        qnode_chunk_size: int = 2048,
+        qnode_chunk_size: int | None = None,
     ):
         super().__init__()
         if ansatz not in _PARAMS_PER_LAYER:
@@ -268,14 +353,6 @@ class TrainableQuanv2d(nn.Module):
         self.n_ansatz_layers = int(n_ansatz_layers)
         self.qdevice = qdevice
         self.qbackend = qbackend
-        # Patches-per-QNode-call cap to bound peak memory. PennyLane's
-        # broadcasted simulation allocates intermediate statevectors of shape
-        # [N, 2^n_qubits] in complex128; for n_qubits=9 each chunk uses
-        # ~chunk_size * 8KB per gate, and the autograd graph retains several
-        # such intermediates. 2048 keeps a single chunk under ~16MB, so even
-        # ~8000 QNode calls per forward (full stem) fit comfortably in RAM.
-        # Set to 0 to disable chunking (single huge call — original behavior).
-        self.qnode_chunk_size = int(qnode_chunk_size)
 
         k = self.kernel_size
         # Number of qubits = patch size (depthwise; Hur uses the same
@@ -284,14 +361,34 @@ class TrainableQuanv2d(nn.Module):
         self.n_params_per_layer = _PARAMS_PER_LAYER[ansatz]
 
         # Build one QNode; reused for all (oc, ic). Parameters are passed in
-        # at call time, so a single QNode object is sufficient.
-        self._qnode = _build_hur_qnode(
+        # at call time, so a single QNode object is sufficient. The builder
+        # also resolves the actual PennyLane device (with fallback), so we
+        # record the resolved name for the chunk-size default and for the
+        # device-aware CPU round-trip in `_run_qnode_batched`.
+        self._resolved_qdevice, self._qnode = _build_hur_qnode(
             n_qubits=self.n_qubits,
             ansatz=self.ansatz,
             n_ansatz_layers=self.n_ansatz_layers,
             qdevice=self.qdevice,
             qbackend=self.qbackend,
         )
+
+        # Patches-per-QNode-call cap to bound peak memory. PennyLane's
+        # broadcasted simulation allocates intermediate statevectors of shape
+        # [N, 2^n_qubits] in complex128; for n_qubits=9 each chunk uses
+        # ~chunk_size * 8KB per gate, and the autograd graph retains several
+        # such intermediates.
+        #   * `default.qubit`: 2048 keeps a single chunk under ~16MB on CPU.
+        #   * Lightning (CPU/GPU): the C++/CUDA kernels handle larger batches
+        #     far more efficiently, so we double the default to 8192 when no
+        #     explicit value is supplied.
+        # Explicit ints (including 0 to disable chunking) are always honoured.
+        if qnode_chunk_size is None:
+            self.qnode_chunk_size = (
+                8192 if self._resolved_qdevice.startswith("lightning.") else 2048
+            )
+        else:
+            self.qnode_chunk_size = int(qnode_chunk_size)
 
         # Trainable ansatz parameters: one set per output channel, shared
         # across input channels. Small init to avoid barren-plateau saturation.
@@ -350,15 +447,27 @@ class TrainableQuanv2d(nn.Module):
         `params` has shape `[n_ansatz_layers, n_params_per_layer]` (the
         per-output-channel slice).
 
-        PennyLane's `default.qubit` keeps its state vector on CPU. When the
-        model is on a CUDA device the caller's tensors live there too; we
-        round-trip through CPU for the QNode call and move the result back.
-        PyTorch's autograd handles the cross-device transitions automatically
-        via `.cpu()` / `.to(device)`, so gradient flow into `self.angles` and
-        upstream tensors is preserved.
+        Device handling:
+          * `default.qubit` and `lightning.qubit` keep their state vector on
+            CPU. When the model is on a CUDA device the caller's tensors
+            live there too; we round-trip through CPU for the QNode call and
+            move the result back. PyTorch's autograd handles the
+            cross-device transitions automatically via `.cpu()` /
+            `.to(device)`, so gradient flow into `self.angles` and upstream
+            tensors is preserved.
+          * `lightning.gpu` keeps the state vector on the GPU natively via
+            cuQuantum. Forcing inputs onto CPU here would cause a redundant
+            round-trip and erase the whole point of using the GPU device, so
+            we SKIP the transfer in that case and pass the CUDA tensors
+            straight to the QNode.
         """
+        # Device-aware CPU round-trip: needed for CPU-resident simulators,
+        # skipped for `lightning.gpu` which already lives on the GPU.
+        needs_cpu_transfer = self._resolved_qdevice in (
+            "default.qubit", "lightning.qubit"
+        )
         orig_device = angles_batch.device
-        if orig_device.type != "cpu":
+        if needs_cpu_transfer and orig_device.type != "cpu":
             angles_batch = angles_batch.cpu()
             params = params.cpu()
 
@@ -492,7 +601,7 @@ class HurConvBNReLU(nn.Module):
         n_ansatz_layers: int,
         qdevice: str,
         qbackend: str | None,
-        qnode_chunk_size: int = 2048,
+        qnode_chunk_size: int | None = None,
     ):
         super().__init__()
         # The stem uses groups=1 everywhere (MedViT.py:425-428); the quanv
@@ -534,7 +643,7 @@ class QMedViTHur2022(QMedViT):
         ansatz: str = "circuit_2",
         n_ansatz_layers: int = 2,
         qdevice: str = "default.qubit",
-        qnode_chunk_size: int = 2048,
+        qnode_chunk_size: int | None = None,
         quantum_layer_indices: list[int] | None = None,
         **kwargs,
     ):
@@ -544,7 +653,11 @@ class QMedViTHur2022(QMedViT):
 
         self.hur_ansatz = ansatz
         self.hur_n_ansatz_layers = int(n_ansatz_layers)
-        self.hur_qnode_chunk_size = int(qnode_chunk_size)
+        # Preserve the `None` sentinel so `TrainableQuanv2d` can pick the
+        # device-aware default (8192 for Lightning, 2048 for default.qubit).
+        self.hur_qnode_chunk_size = (
+            None if qnode_chunk_size is None else int(qnode_chunk_size)
+        )
         # Stem-layer indices selected for quantum replacement. `None` =
         # replace every ConvBNReLU (legacy behavior).
         self.hur_quantum_layer_indices = quantum_layer_indices

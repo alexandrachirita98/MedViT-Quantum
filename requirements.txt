@@ -1,5 +1,10 @@
 einops
 pennylane
+pennylane-lightning
+# Optional: GPU state-vector simulator. May fail to install in environments
+# without CUDA toolkit + cuQuantum (e.g. CPU-only Colab); the Hur2022 model
+# auto-falls back to lightning.qubit / default.qubit when missing.
+pennylane-lightning-gpu
 timm==1.0.8
 medmnist==3.0.1
 numpy
